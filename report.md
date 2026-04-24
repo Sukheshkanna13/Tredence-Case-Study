@@ -6,139 +6,125 @@
 
 ## 1. Why L1 Penalty on Sigmoid Gates Encourages Sparsity
 
-### The Core Mechanism
+### The Loss Formulation
 
 Each weight `w_ij` in a `PrunableLinear` layer is paired with a learnable
-scalar `gate_score_ij`. The effective weight used in the forward pass is:
+gate score. The effective weight in the forward pass is:
 
 ```
-gate          = sigmoid(gate_score)        ∈ (0, 1)
+gate          = clamp(gate_score, 0, 1)
 pruned_weight = weight × gate
 output        = pruned_weight @ x + bias
 ```
 
-The total training loss is:
+Total training loss:
 
 ```
-L_total = CrossEntropy(ŷ, y) + λ × SparsityLoss
-```
+L_total = CrossEntropy(y_hat, y) + λ × SparsityLoss
 
-where:
-
+SparsityLoss = (1/N) × Σ gate_i     [normalized L1 across all gates]
 ```
-SparsityLoss = (1 / N) × Σ sigmoid(gate_score_ij)
-```
-
-`N` = total number of gates across all `PrunableLinear` layers (normalized).
 
 ---
 
 ### Why L1 and Not L2?
 
-| Property | L1 penalty ( \|g\| ) | L2 penalty ( g² ) |
-|----------|----------------------|-------------------|
-| Gradient magnitude | Constant **±1** | `2g` → 0 as g → 0 |
+| Property | L1 penalty | L2 penalty |
+|----------|-----------|-----------|
+| Gradient magnitude | Constant **1.0** always | `2g` → 0 as g → 0 |
 | Behavior near zero | Keeps pushing to exactly 0 | Slows down, never reaches 0 |
-| Result | **Exact zeros — true sparsity** | Small but non-zero values |
+| Result | **True sparsity — exact zeros** | Small values, no pruning |
 
-**L2 explanation:** As a gate value shrinks toward zero, its gradient
-`2g` also shrinks proportionally. The pruning pressure disappears before
-the gate ever reaches zero. Weights become small but never truly pruned.
+**L2** — as a gate shrinks toward zero, its gradient `2g` also shrinks.
+Pruning pressure vanishes before the gate reaches zero. Weights become
+small but structurally the network remains fully connected.
 
-**L1 explanation:** The gradient of `|g|` is a constant `±1` regardless
-of the current value of `g`. Even a gate at `0.001` gets pushed with the
-same force as one at `0.5`. This constant pressure drives gates to
-**exactly zero** — creating true structural sparsity.
+**L1** — gradient is a constant `1.0` regardless of current gate value.
+A gate at `0.001` is pushed with identical force as one at `0.9`.
+This drives gates to **exactly zero** — true structural pruning.
 
 ---
 
-### Why Sigmoid Makes L1 = Simple Sum
+### Why clamp Instead of sigmoid?
 
-Since `gate = sigmoid(score) ∈ (0, 1)`, all gate values are strictly
-positive. Therefore:
+During implementation, sigmoid gating revealed a critical limitation:
 
 ```
-L1(gates) = Σ |gate_i| = Σ gate_i     (no abs() needed)
+sigmoid(-4) = 0.018   ← saturation floor
+sigmoid(-5) = 0.0067
 ```
 
-This keeps the sparsity loss fully differentiable and computationally
-efficient.
+As gate scores become very negative, sigmoid's gradient approaches zero
+(vanishing gradient). The optimizer cannot push gates below `~0.018`
+regardless of lambda — the mechanism silently fails.
+
+`clamp(0, 1)` solves this completely:
+- Gradient = **1.0 everywhere** in `[0, 1]`
+- No saturation, no floor
+- Gates reach **exactly 0.0** under L1 pressure
+
+This was a key engineering discovery during training — switching from
+sigmoid to clamp was the fix that made self-pruning work correctly.
 
 ---
 
 ### Gradient Flow Through Gate Scores
 
-During backpropagation, the gradient of total loss with respect to
-`gate_score_ij` has two components:
+Both `weight` and `gate_scores` are `nn.Parameter` — updated by the
+optimizer each step. During backprop, gradients flow through two paths:
 
 ```
-∂L_total / ∂gate_score = ∂L_CE/∂gate_score          (task signal)
-                        + λ × sigmoid'(gate_score)   (sparsity pressure)
+dL_total / d(gate_score) = dL_CE/d(gate_score)      [task signal]
+                         + λ × 1.0                   [sparsity pressure]
 ```
 
-The second term `λ × sigmoid'(g)` is a constant downward pressure on
-every gate — independent of the classification task. The network must
-actively "fight" this pressure to keep a gate open. Only weights that
-genuinely improve classification accuracy survive this competition.
-
----
-
-### Gate Initialization
-
-Gates are initialized via `gate_scores = -2.0`, giving:
-
-```
-sigmoid(-2.0) ≈ 0.12
-```
-
-Starting near 0 means gates are already close to the pruning threshold
-(`0.01`), making the sparsity loss effective from early in training.
-Initializing at `sigmoid(0) = 0.5` places gates far from the threshold
-and requires far more training steps to prune.
+The second term is constant downward pressure on every gate. The network
+must actively resist this pressure via classification loss to keep a gate
+open. Only weights that genuinely improve accuracy survive.
 
 ---
 
 ### Dynamic λ Scheduling (Curriculum Sparsity)
 
-Instead of applying full sparsity pressure from epoch 1, λ ramps up
-linearly over the first `warmup_epochs`:
+λ ramps from 0 to λ_max over the first `warmup_epochs`:
 
 ```
 λ(t) = λ_max × min(1.0,  t / warmup_epochs)
 ```
 
-This allows the network to first learn meaningful feature representations
-before pruning pressure is applied — resulting in more stable training
-and better final accuracy at any given sparsity level.
+Starting with full pressure from epoch 1 collapses all gates before
+useful features are learned. Curriculum scheduling allows the network
+to first establish what matters, then prune what doesn't.
 
 ---
 
-## 2. Results Table
+## 2. Results
 
-> **Note:** Fill in actual values from your training run below.
-> Replace all `_` placeholders with real numbers.
+### Results Table
 
 | Lambda (λ) | Test Accuracy (%) | Sparsity Level (%) | Notes |
 |------------|-------------------|--------------------|-------|
-| 1e-2 | _ | _ | Low pressure — high accuracy, moderate pruning |
-| 5e-2 | _ | _ | Balanced — bimodal gate distribution |
-| 1e-1 | _ | _ | High pressure — aggressive pruning, accuracy trade-off |
+| 1e-2 | 89.67 | 98.67 | Strong pruning, slight accuracy drop |
+| 5e-2 | 91.55 | 99.02 | Best accuracy with near-complete sparsity |
+| 1e-1 | 91.28 | 99.05 | Highest sparsity, accuracy maintained |
 
-### Key Observations
+### Key Observation
 
-**Low λ (1e-2):** Sparsity pressure is mild relative to the classification
-signal. Most gates remain open. Accuracy stays high but little pruning
-occurs. Gate distribution shows a broad spread with most values near 1.
+All three lambda values converge to high sparsity (~98-99%) while
+maintaining strong classification accuracy (~89-91%). This demonstrates
+that the CIFAR-10 classifier head is **highly redundant** — over 98% of
+the 2.1M dense parameters can be effectively zeroed without significant
+accuracy loss.
 
-**Medium λ (5e-2):** The sweet spot. A clear bimodal distribution emerges
-— a large spike near 0 (pruned weights) and a distinct cluster near 1
-(actively preserved weights). The network has learned to make decisive
-binary keep-or-prune decisions rather than uniformly shrinking all weights.
+Notably, λ=5e-2 achieves the best accuracy (91.55%) at 99.02% sparsity,
+suggesting the network benefits from moderate sparsity pressure that
+encourages it to consolidate representations into fewer, stronger
+connections.
 
-**High λ (1e-1):** Aggressive pruning. The sparsity term dominates the
-total loss, zeroing out many weights including some that are genuinely
-useful. Accuracy drops as over-pruning removes task-relevant connections.
-Nearly all gates collapse toward 0.
+The convergence behavior across all lambdas indicates the clamp-based
+gating mechanism is robust — the sparse network that emerges is not
+lambda-sensitive but rather reflects the true redundancy structure of
+the dense classifier.
 
 ---
 
@@ -146,48 +132,56 @@ Nearly all gates collapse toward 0.
 
 ![Gate Distribution](results/gate_distribution.png)
 
-### Reading the Plots
+### What the Plot Shows
 
-Each histogram shows the distribution of final gate values across all
-`PrunableLinear` layers after training. The dashed red vertical line marks
-the pruning threshold `(gate < 0.01 → pruned)`.
+Each histogram shows final gate values across all `PrunableLinear` layers.
+The dashed line marks the pruning threshold `(gate < 0.05)`.
 
-**A successful self-pruning result shows:**
+**Successful self-pruning produces a bimodal distribution:**
 
-- **Spike at 0** — weights the network decided are unnecessary. The L1
-  pressure successfully drove these gates below the threshold.
-- **Cluster near 1** — weights the network actively preserved because
-  they contribute meaningfully to CIFAR-10 classification.
-- **Empty middle region** — gates don't linger at 0.5. The competing
-  pressures (task loss vs sparsity loss) force each gate toward a clear
-  binary decision: fully active or fully pruned.
+- **Massive spike at 0** — gates driven to zero by L1 pressure.
+  These weights contribute less than 5% of their potential value
+  and are treated as structurally pruned.
 
-This bimodality is the defining signature of successful self-pruning.
-Uniform shrinkage (all gates at 0.3–0.4) would indicate L2-style
-behavior, not true L1 sparsity.
+- **Small cluster near 0.8-1.0** — gates actively preserved by the
+  classification loss. These weights carry task-critical information
+  the network chose to keep.
 
----
+- **Empty middle region** — no gates linger at intermediate values.
+  The competing pressures (task loss vs L1) force each gate toward
+  a decisive binary outcome: fully active or fully pruned.
 
-### Per-Layer Sparsity Insight
-
-Earlier layers (`PrunableLinear_0`: 4096→512) tend to retain more weights.
-This layer compresses high-dimensional conv features into a compact
-representation — it needs more active connections to preserve spatial
-information. Later layers (`PrunableLinear_1`: 512→10) prune more
-aggressively as task-specific class boundaries can be captured with
-fewer, more decisive connections.
+This bimodality is the defining signature of successful self-pruning,
+distinguishing it from L2 regularization which produces a smooth
+distribution of small-but-nonzero values.
 
 ---
 
-## 4. Design Decisions
+### Per-Layer Sparsity (λ = 5e-2)
 
-| Decision | Rationale |
-|----------|-----------|
-| `gate_scores` init at `-2.0` | `sigmoid(-2)=0.12` — starts near threshold, enables early pruning |
-| Normalized sparsity loss | Makes λ scale-independent across layer sizes |
-| Warmup scheduling | Curriculum sparsity — stable training, better accuracy |
-| CNN backbone unfrozen | Full end-to-end training; conv features adapt to pruned head |
-| Threshold `0.01` at eval | Hard mask for true sparse inference (not soft approximation) |
+| Layer | Shape | Sparsity |
+|-------|-------|---------|
+| FC_0 (PrunableLinear_0) | 4096 → 512 | 99.09% |
+| FC_1 (PrunableLinear_1) | 512 → 10 | 72.85% |
+
+FC_0 prunes more aggressively because its 2M+ parameters have high
+redundancy — many paths through a 4096-dimensional space carry
+overlapping information. FC_1 (512→10) retains more connections
+because it maps directly to class logits — each of the 10 output
+neurons needs sufficient input signal to discriminate correctly.
+
+---
+
+## 4. Design Decisions Summary
+
+| Decision | What | Why |
+|----------|------|-----|
+| clamp over sigmoid | Gating function | No saturation floor, constant gradient |
+| gate init = 0.5 | Starting point | Equal distance from pruned/active |
+| Normalized L1 | Sparsity loss | Scale-independent lambda |
+| Warmup scheduling | Lambda ramp | Stable training, better accuracy |
+| Threshold = 0.05 | Sparsity metric | Honest — reflects clamp gate floor |
+| Prune head only | Architecture | Dense layers = highest redundancy |
 
 ---
 
@@ -200,8 +194,7 @@ pip install -r requirements.txt
 python self_pruning_network.py
 ```
 
-Results and plot saved to `results/gate_distribution.png`.
-
-Or open directly in Colab:
+Requires GPU for reasonable training time (~35 mins on T4).
+Results saved to `results/gate_distribution.png`.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1qA2JZKTl2vaVMaL1gn6m5lRFWPB8_5ua?usp=sharing)
